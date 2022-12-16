@@ -1,11 +1,14 @@
+import timeit
 from typing import Protocol
 
 import numpy as np
 from matplotlib import pyplot as plt
 from numpy import ndarray
+from scipy import interpolate
 from scipy.spatial.transform import Rotation as R
 from scipy import ndimage
 
+DEBUG_TIME = False
 
 class Grasp3DCore(object):
 
@@ -93,57 +96,64 @@ class Grasp3DViewer(object):
         return view
 
     def camera_view(self, camera_position:ndarray, camera_rotation:R, camera_fov:ndarray, camera_height:int, camera_width:int, camera_depth_resolution:int):
+        # record the time
+        if DEBUG_TIME:
+            start = timeit.default_timer()
         # first we copy the experiment to a new array
         view = self.core.experiment.copy()
-        # we now find in polar coordinates around the camera the bounding box of the view
-        # we first find the distance from the camera to each point of the view
-        # we create a grid of the same size as the view
-        x, y, z = np.meshgrid(np.arange(self.core.width).astype(float), np.arange(self.core.height).astype(float), np.arange(self.core.depth).astype(float))
-        # now we transform the grid to have the camera at the origin
-        x -= camera_position[0]
-        y -= camera_position[1]
-        z -= camera_position[2]
-        # now we rotate the grid to have the camera looking in the z direction
-        grid = np.stack([x, y, z], axis=3)
-        # first we get the rotation as 3x3 matrix
+        # find the indices of the first 3 axes of the non zero elements
+        non_zero_indices = np.nonzero(view)
+        # ignore axe 3 and remove duplicates
+        non_zero_indices = np.unique(non_zero_indices[0:3], axis=1)
+        # copy the non zero indices to a new array to save the original cartesian coordinates
+        non_zero_indices_cartesian = non_zero_indices.copy()
+        # offset the indices by the camera position
+        non_zero_indices = non_zero_indices - camera_position[:, np.newaxis]
+        # rotate the indices by the camera rotation
         rotation_matrix = camera_rotation.as_matrix()
-        # then we rotate the grid by multiplying the inverse rotation matrix by the grid
-        grid = np.einsum("ij, lmnj-> lmni", rotation_matrix, grid)
-        # now we find the distance from the camera to each point of the view
-        distance = np.sqrt(grid[:,:,:,0] ** 2 + grid[:,:,:,1] ** 2 + grid[:,:,:,2] ** 2)
-        # now we find the latitude and longitude of each point of the view
-        latitude = np.arctan2(grid[:,:,:,1], grid[:,:,:,0])
-        longitude = np.arctan2(grid[:,:,:,2], np.sqrt(grid[:,:,:,0] ** 2 + grid[:,:,:,1] ** 2))
-        # now we find the bounding box of the view
-        #bbox = np.array([np.min(distance), np.max(distance), np.min(latitude), np.max(latitude), np.min(longitude), np.max(longitude)])
+        non_zero_indices = rotation_matrix @ non_zero_indices
+        # find the distance of the non zero elements from the camera
+        distance = np.linalg.norm(non_zero_indices, axis=0)
+        # find the latitude of the non zero elements from the camera
+        latitude = np.arctan2(non_zero_indices[1], non_zero_indices[0])
+        # find the longitude of the non zero elements from the camera
+        longitude = np.arctan2(non_zero_indices[2], (non_zero_indices[0] ** 2 + non_zero_indices[1] ** 2) ** 0.5)
+        # stack distance, latitude and longitude
+        non_zero_indices = np.stack([distance, latitude, longitude], axis=0)
+
         # we now compute the latitude and longitude difference between each pixel of the view
         latitude_step = camera_fov[0] / camera_width
         longitude_step = camera_fov[1] / camera_height
         depth_step = (camera_fov[3] - camera_fov[2]) / camera_depth_resolution
-        # now we create a polar grid matching the camera field of view
-        rho, theta, phi = np.meshgrid(
-            np.arange(camera_fov[2], camera_fov[3], depth_step).astype(float),
-            np.arange(-camera_fov[0]/2, camera_fov[0]/2, latitude_step).astype(float),
-            np.arange(-camera_fov[1]/2, camera_fov[1]/2, longitude_step).astype(float)
-            )
-        polar_grid = np.stack([rho, theta, phi], axis=3)
-        polar_view = np.zeros_like(polar_grid)
         # we now assign to the polar grid the color of the maximum color of the view for pixels within half a step of the polar grid
+        polar_view = np.zeros((camera_depth_resolution, camera_height, camera_width, 3))
         # we first find for each pixel in the cartesian grid the nearest pixel in the polar grid
-        grid = np.stack([distance, latitude, longitude], axis=3)
-        # we now round the grid to the nearest pixel in the polar grid
-        # first we offset the grid to have the minimum value of the polar grid at 0
-        grid -= np.array([camera_fov[2], -camera_fov[0]/2, -camera_fov[1]/2])
-        # now we round the grid to the nearest pixel in the polar grid
-        grid = np.round(grid / np.array([depth_step, latitude_step, longitude_step])).astype(int)
-        # we now set any grid value outside the polar grid to 0
-        grid[grid < 0] = 0
-        grid[grid[:, :, :, 0] >= camera_depth_resolution, 0] = camera_depth_resolution - 1
-        grid[grid[:, :, :, 1] >= camera_width, 1] = camera_width - 1
-        grid[grid[:, :, :, 2] >= camera_height, 2] = camera_height - 1
 
-        polar_view[grid[:, :, :, 0], grid[:, :, :, 1], grid[:, :, :, 2]] = view
+        # we now round the non zero indices to the nearest pixel in the polar grid
+        # first we offset the indices to have the minimum value of the polar grid at 0
+        non_zero_indices = non_zero_indices - np.array([camera_fov[2], -camera_fov[0] / 2, -camera_fov[1] / 2])[:, np.newaxis]
+        # now we divide by the step to find the nearest pixel in the polar grid
+        non_zero_indices = non_zero_indices / np.array([depth_step, latitude_step, longitude_step])[:, np.newaxis]
+        # now we round to the nearest pixel in the polar grid
+        non_zero_indices = np.round(non_zero_indices).astype(int)
+        # create a mask that selects only the indeces inside the polar grid bounds
+        mask = np.all(np.logical_and(non_zero_indices >= 0, non_zero_indices < np.array([camera_depth_resolution, camera_height, camera_width])[:, np.newaxis]), axis=0)
+        # apply the mask to the non zero indices
+        non_zero_indices = non_zero_indices[:, mask]
+        # apply the mask to the non zero indices cartesian
+        non_zero_indices_cartesian = non_zero_indices_cartesian[:, mask]
+        # create a mask that selects the unique indices
+        mask = np.unique(non_zero_indices, axis=1, return_index=True)[1]
+        # apply the mask to the non zero indices
+        non_zero_indices = non_zero_indices[:, mask]
+        # apply the mask to the non zero indices cartesian
+        non_zero_indices_cartesian = non_zero_indices_cartesian[:, mask]
+        # we now assign to the polar grid at the non zero indices the color of the view at the corresponding non zero indices cartesian
+        polar_view[non_zero_indices[0], non_zero_indices[1], non_zero_indices[2]] = view[non_zero_indices_cartesian[0], non_zero_indices_cartesian[1], non_zero_indices_cartesian[2]]
+
         return self.view_from_axis(0, False, view=polar_view, reference_axis=False)
+
+
 
     def plot_views(self):
         # plot the views from the top, front, left and right
