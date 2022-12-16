@@ -1,4 +1,5 @@
 import math
+from abc import abstractmethod
 
 import numpy as np
 from numpy import ndarray
@@ -20,13 +21,42 @@ class AbstractShape3D(Shape3D):
         # use the labels to create a grid of points
         return np.stack([x, y, z], axis=3).astype(float)
 
-    def init_canvas(self, position):
+    def init_canvas(self, position: ndarray) -> ndarray:
         pos = np.round(position).astype(int)
         self.canvas = self.experiment[
                  pos[0] - self.canvas_radius:pos[0] + self.canvas_radius,
                  pos[1] - self.canvas_radius:pos[1] + self.canvas_radius,
                  pos[2] - self.canvas_radius:pos[2] + self.canvas_radius,
                  :].copy()
+        return self.canvas
+
+    @abstractmethod
+    def get_base_imitation_grasps(self,
+                                  gripper_width: float,
+                                  gripper_length: float,
+                                  gripper_aperture: float
+                                  ) -> ndarray:
+        # abstract method that returns the unrotated uncentered grasps for the object
+        # return the grasps as 3x4 SE(3) matrices shaped as (n, 3, 4)
+        # must be implemented by the child class
+        pass
+
+    def get_imitation_grasps(self,
+                             position: ndarray,
+                             rotation: ndarray,
+                             gripper_width: float,
+                             gripper_length: float,
+                             gripper_aperture: float
+                             ) -> ndarray:
+        # get the base grasps
+        grasps = self.get_base_imitation_grasps(gripper_width, gripper_length, gripper_aperture)
+        # rotate the grasps
+        grasps_r = np.einsum('ik, lkj -> lij', rotation, grasps[:, :3, :3])
+        # translate the grasps
+        grasps_t = grasps[:, :3, 3] + position
+        # return the grasps
+        return np.concatenate([grasps_r, grasps_t[:, :, np.newaxis]], axis=2)
+
 
     @property
     def canvas_radius(self):
@@ -89,6 +119,88 @@ class Box(AbstractShape3D):
         inside = inside.all(axis=0)
         self.paint_object_in_sim(position, inside)
 
+    def get_base_imitation_grasps(self,
+                                  gripper_width: float,
+                                  gripper_length: float,
+                                  gripper_aperture: float
+                                  ) -> ndarray:
+        # return the grasps as 3x4 SE(3) matrices shaped as (n, 3, 4)
+        # must be implemented by the child class
+        grasps = []
+        if gripper_aperture > self.dimensions[0]:
+            # if the gripper aperture is bigger than the width of the box
+            # then the gripper can grasp the box from the left and right faces looking at it from
+            # the front, the back, the top and the bottom
+            grasps.append(np.array([
+                [0, 0, 1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, 1, 0, 0],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, 1, 0, 0],
+                [1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, 1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, -1, 0, 0],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, -1, 0, 0],
+                [1, 0, 0, 0]
+            ]))
+        if gripper_aperture > self.dimensions[1]:
+            # if the gripper aperture is bigger than the height of the box
+            # then the gripper can grasp the box from the top and bottom faces looking at it from
+            # the front, the back, the left and the right
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, 1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, 1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, -1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, -1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [1, 0, 0, 0]
+            ]))
+        if gripper_aperture > self.dimensions[2]:
+            # if the gripper aperture is bigger than the depth of the box
+            # then the gripper can grasp the box from the front and back faces looking at it from
+            # the top, the bottom, the left and the right
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, 1, 0, 0],
+                [-1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, 1, 0, 0],
+                [1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, -1, 0, 0],
+                [-1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, -1, 0, 0],
+                [1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+        return np.array(grasps)
+
 
 class Ellipsoid(AbstractShape3D):
 
@@ -112,6 +224,88 @@ class Ellipsoid(AbstractShape3D):
         # check if the dot product is smaller than 1
         inside = dot_products < 1
         self.paint_object_in_sim(position, inside)
+
+    def get_base_imitation_grasps(self,
+                                  gripper_width: float,
+                                  gripper_length: float,
+                                  gripper_aperture: float
+                                  ) -> ndarray:
+        # return the grasps as 3x4 SE(3) matrices shaped as (n, 3, 4)
+        # must be implemented by the child class
+        grasps = []
+        if gripper_aperture > self.dimensions[0]:
+            # if the gripper aperture is bigger than the width of the ellipsoid
+            # then the gripper can grasp the ellipsoid from the left and right faces looking at it from
+            # the front, the back, the top and the bottom
+            grasps.append(np.array([
+                [0, 0, 1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, 1, 0, 0],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, 1, 0, 0],
+                [1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, 1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, -1, 0, 0],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, np.minimum( self.dimensions[0] / 2 - gripper_length, 0)],
+                [0, -1, 0, 0],
+                [1, 0, 0, 0]
+            ]))
+        if gripper_aperture > self.dimensions[1]:
+            # if the gripper aperture is bigger than the height of the ellipsoid
+            # then the gripper can grasp the ellipsoid from the top and bottom faces looking at it from
+            # the front, the back, the left and the right
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, 1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, 1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, -1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [-1, 0, 0, 0]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, -1, 0, np.minimum( self.dimensions[1] / 2 - gripper_length, 0)],
+                [1, 0, 0, 0]
+            ]))
+        if gripper_aperture > self.dimensions[2]:
+            # if the gripper aperture is bigger than the depth of the ellipsoid
+            # then the gripper can grasp the ellipsoid from the front and back faces looking at it from
+            # the top, the bottom, the left and the right
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, 1, 0, 0],
+                [-1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, 1, 0, 0],
+                [1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+            grasps.append(np.array([
+                [0, 0, 1, 0],
+                [0, -1, 0, 0],
+                [-1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+            grasps.append(np.array([
+                [0, 0, -1, 0],
+                [0, -1, 0, 0],
+                [1, 0, 0, np.minimum( self.dimensions[2] / 2 - gripper_length, 0)]
+            ]))
+        return np.array(grasps)
 
 
 class CompositeShape(AbstractShape3D):
@@ -139,6 +333,52 @@ class CompositeShape(AbstractShape3D):
 
     def add_primitive(self, shape:type, position:ndarray, rotation:R, dimensions:ndarray):
         self.shapes.append((shape, position, rotation, dimensions))
+
+    def get_base_imitation_grasps(self,
+                                  gripper_width: float,
+                                  gripper_length: float,
+                                  gripper_aperture: float
+                                  ) -> ndarray:
+        # return the grasps as 3x4 SE(3) matrices shaped as (n, 3, 4)
+        # must be implemented by the child class
+        grasps = []
+        for shape in self.shapes:
+            # add the grasps of each primitive
+            primitive = shape[0]()
+            primitive.core = self.core
+            primitive.dimensions = shape[3] * self.dimensions/100
+            primitive_rotation = shape[2]
+            primitive_position = shape[1] * self.dimensions/100
+            primitive_grasps = primitive.get_imitation_grasps(primitive_position, primitive_rotation.as_matrix(), gripper_width, gripper_length, gripper_aperture)
+            for grasp in primitive_grasps:
+                # transform the grasp from the primitive frame to the composite shape frame
+                grasp = np.linalg.inv(primitive_rotation.as_matrix()) @ grasp
+                grasp[:, 3] = primitive_position - grasp[:, 3]
+                grasps.append(grasp)
+        # check for all the grasps if the back of the gripper is colliding with the composite shape
+        # if so remove the grasp
+        grasps = np.array(grasps)
+        remove_grasps = []
+        for i in range(len(grasps)):
+            # compute the position of the back of the gripper
+            gripper_position = grasps[i, :, 3] - grasps[i, :, 2] * gripper_length
+            # check if any primitive occupies the cube of size gripper_length /2 on the gripper position
+            for shape in self.shapes:
+                bbox = [shape[1] * self.dimensions/100 - shape[3] * self.dimensions/100/2,
+                        shape[1] * self.dimensions/100 + shape[3] * self.dimensions/100/2]
+                if np.all(gripper_position + gripper_length/2 > bbox[0]) and np.all(gripper_position - gripper_length/2 < bbox[1]):
+                    remove_grasps.append(i)
+                    break
+        grasps = np.delete(grasps, remove_grasps, axis=0)
+        return grasps
+
+
+
+
+            # check if the gripper is colliding with the composite shape
+
+        return np.array(grasps)
+
 
 
 class HShape(CompositeShape):

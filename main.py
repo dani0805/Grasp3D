@@ -18,6 +18,9 @@ def main(*args, **kwargs):
 
     sim = Grasp3DCore()
     sim.reset_experiment()
+    gripper_width = 10.
+    gripper_length = 30.
+    gripper_aperture = 30.
     for i in range(3):
         center = np.random.randint(20, 180, 3)
         rotation = R.random()
@@ -44,6 +47,22 @@ def main(*args, **kwargs):
         h.dimensions = np.random.randint(30, 50, 3)
         h.color = random_color()
         h.plot(center, rotation)
+
+        for grasp in h.get_imitation_grasps(center, rotation.as_matrix(), gripper_width, gripper_length, gripper_aperture):
+            success, err = sim.test_grasp(
+                grasp[:,3],
+                R.from_matrix(grasp[:,:3]),
+                gripper_width,
+                gripper_length,
+                gripper_aperture,
+                0.1,
+                0.1,
+                0.1
+            )
+            if success:
+                print("Success")
+            else:
+                print(err)
 
     viewer = Grasp3DViewer(sim)
 

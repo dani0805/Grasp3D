@@ -1,5 +1,6 @@
 import timeit
 from typing import Protocol
+from enum import Enum
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -9,6 +10,15 @@ from scipy.spatial.transform import Rotation as R
 from scipy import ndimage
 
 DEBUG_TIME = False
+
+
+class GraspingError(Enum):
+    OUT_OF_BOUNDS = 1
+    COLLISION = 2
+    NO_OBJECT = 3
+    ALIGNMENT = 4
+    TILT = 5
+
 
 class Grasp3DCore(object):
 
@@ -22,6 +32,69 @@ class Grasp3DCore(object):
     def reset_experiment(self):
         self.experiment = np.zeros((self.width, self.height, self.depth, 3))
 
+    def test_grasp(self,
+                   position: ndarray,
+                   rotation: R,
+                   gripper_width: float,
+                   gripper_length: float,
+                   gripper_aperture: float,
+                   volume_threshold: float = 0.5,
+                   alignment_threshold: float = 0.5,
+                   angle_threshold: float = 0.5,
+                   ) -> (bool, GraspingError):
+        # slice the experiment to get the maximum area the gripoer can cover
+        gripper_radius = ((gripper_width / 2) ** 2 + (gripper_length / 2) ** 2 + (gripper_aperture / 2) ** 2) ** 0.5
+        # check if the gripper is out of bounds
+        if np.any(position - gripper_radius < 0) or np.any(position + gripper_radius > self.experiment.shape[:3]):
+            return False, GraspingError.OUT_OF_BOUNDS
+
+        test_area = self.experiment[
+                    int(position[0] - gripper_radius):int(position[0] + gripper_radius),
+                    int(position[1] - gripper_radius):int(position[1] + gripper_radius),
+                    int(position[2] - gripper_radius):int(position[2] + gripper_radius),
+                    :].copy()
+        # rotate the test area
+        test_area = ndimage.rotate(test_area, rotation.as_euler('xyz')[0], axes=(1, 0), reshape=False)
+        test_area = ndimage.rotate(test_area, rotation.as_euler('xyz')[1], axes=(2, 0), reshape=False)
+        test_area = ndimage.rotate(test_area, rotation.as_euler('xyz')[2], axes=(1, 2), reshape=False)
+        # select the area of the gripper that is inside the test area
+        gripper_area = test_area[
+                       int(gripper_radius - gripper_width / 2):int(gripper_radius + gripper_width / 2),
+                       int(gripper_radius - gripper_length / 2):int(gripper_radius + gripper_length / 2),
+                       int(gripper_radius - gripper_aperture / 2):int(gripper_radius + gripper_aperture / 2),
+                       :]
+        # check if the gripper top and bottom are not touching an object
+        if np.any(gripper_area[:, :, 0, :] != 0) or np.any(gripper_area[:, :, 0, :] != 0):
+            return False, GraspingError.COLLISION
+        # set every non-zero value to 1 and remove the last dimension
+        gripper_area = np.any(gripper_area, axis=3)
+        # check if there is enough object in the gripper
+        if np.average(gripper_area[:, :, 1:-1]) < volume_threshold:
+            return False, GraspingError.NO_OBJECT
+        # check if the gripper is aligned with the object
+        # compute the maximum along the z axis and compare it with the minimum
+        max_height = np.max(gripper_area[:, :, 1:-1], axis=2)
+        min_height = np.min(gripper_area[:, :, 1:-1], axis=2)
+        if np.average(max_height - min_height) < alignment_threshold:
+            return False, GraspingError.ALIGNMENT
+        # check the gripper is not too tilted
+        # make a linear regression on object height
+        x = np.arange(gripper_area.shape[0])
+        y = np.arange(gripper_area.shape[1])
+        xx, yy = np.meshgrid(x, y)
+        x = xx[gripper_area[:, :, 1:-1]]
+        y = yy[gripper_area[:, :, 1:-1]]
+        z = np.arange(gripper_area.shape[2])[1:-1][gripper_area[:, :, 1:-1]]
+        f = interpolate.interp2d(x, y, z, kind='linear')
+        xnew = np.arange(gripper_area.shape[0])
+        ynew = np.arange(gripper_area.shape[1])
+        znew = f(xnew, ynew)
+        # compute the angle between the gripper and the object
+        angle = np.arctan(np.max(znew) - np.min(znew))
+        if angle > angle_threshold:
+            return False, GraspingError.TILT
+        return True, None
+
 
 class Shape3D(Protocol):
     dimensions: ndarray
@@ -34,7 +107,22 @@ class Shape3D(Protocol):
     def plot(self, position: ndarray, rotation: R, experiment: ndarray = None) -> None:
         ...
 
-    def get_hitbox(self, position: ndarray, rotation:ndarray) -> ndarray:
+    def get_hitbox(self, position: ndarray, rotation: ndarray) -> ndarray:
+        ...
+
+    def init_grid(self) -> ndarray:
+        ...
+
+    def init_canvas(self, position: ndarray) -> ndarray:
+        ...
+
+    def get_imitation_grasps(self,
+                             position: ndarray,
+                             rotation: ndarray,
+                             gripper_width: float,
+                             gripper_length: float,
+                             gripper_aperture: float,
+                             ) -> ndarray:
         ...
 
 
@@ -70,7 +158,8 @@ class Grasp3DViewer(object):
         # now we set to zero the z-channel of the zero elements
         view[np.all(view[:, :, :, 0:3] == 0, axis=3), 3] = 0
         # we now take the argmax of the z-channel to find the first non zero element from the top if top is true else from the bottom excluding 0
-        first_non_zero = np.argmax(view[:, :, :, 3], axis=axis) if top else np.argmin(np.where(view[:, :, :, 3] > 0, view[:, :, :, 3], 10e5), axis=axis)
+        first_non_zero = np.argmax(view[:, :, :, 3], axis=axis) if top else np.argmin(
+            np.where(view[:, :, :, 3] > 0, view[:, :, :, 3], 10e5), axis=axis)
         # we now take the first non zero element from the top discarding the z-channel
         if axis == 2:
             view = view[np.arange(bbox[0])[:, None],
@@ -95,7 +184,8 @@ class Grasp3DViewer(object):
                 view = np.flip(view, axis=1)
         return view
 
-    def camera_view(self, camera_position:ndarray, camera_rotation:R, camera_fov:ndarray, camera_height:int, camera_width:int, camera_depth_resolution:int):
+    def camera_view(self, camera_position: ndarray, camera_rotation: R, camera_fov: ndarray, camera_height: int,
+                    camera_width: int, camera_depth_resolution: int):
         # record the time
         if DEBUG_TIME:
             start = timeit.default_timer()
@@ -131,13 +221,15 @@ class Grasp3DViewer(object):
 
         # we now round the non zero indices to the nearest pixel in the polar grid
         # first we offset the indices to have the minimum value of the polar grid at 0
-        non_zero_indices = non_zero_indices - np.array([camera_fov[2], -camera_fov[0] / 2, -camera_fov[1] / 2])[:, np.newaxis]
+        non_zero_indices = non_zero_indices - np.array([camera_fov[2], -camera_fov[0] / 2, -camera_fov[1] / 2])[:,
+                                              np.newaxis]
         # now we divide by the step to find the nearest pixel in the polar grid
         non_zero_indices = non_zero_indices / np.array([depth_step, latitude_step, longitude_step])[:, np.newaxis]
         # now we round to the nearest pixel in the polar grid
         non_zero_indices = np.round(non_zero_indices).astype(int)
         # create a mask that selects only the indeces inside the polar grid bounds
-        mask = np.all(np.logical_and(non_zero_indices >= 0, non_zero_indices < np.array([camera_depth_resolution, camera_height, camera_width])[:, np.newaxis]), axis=0)
+        mask = np.all(np.logical_and(non_zero_indices >= 0, non_zero_indices < np.array(
+            [camera_depth_resolution, camera_height, camera_width])[:, np.newaxis]), axis=0)
         # apply the mask to the non zero indices
         non_zero_indices = non_zero_indices[:, mask]
         # apply the mask to the non zero indices cartesian
@@ -149,11 +241,10 @@ class Grasp3DViewer(object):
         # apply the mask to the non zero indices cartesian
         non_zero_indices_cartesian = non_zero_indices_cartesian[:, mask]
         # we now assign to the polar grid at the non zero indices the color of the view at the corresponding non zero indices cartesian
-        polar_view[non_zero_indices[0], non_zero_indices[1], non_zero_indices[2]] = view[non_zero_indices_cartesian[0], non_zero_indices_cartesian[1], non_zero_indices_cartesian[2]]
+        polar_view[non_zero_indices[0], non_zero_indices[1], non_zero_indices[2]] = view[
+            non_zero_indices_cartesian[0], non_zero_indices_cartesian[1], non_zero_indices_cartesian[2]]
 
         return self.view_from_axis(0, False, view=polar_view, reference_axis=False)
-
-
 
     def plot_views(self):
         # plot the views from the top, front, left and right
@@ -173,15 +264,17 @@ class Grasp3DViewer(object):
         # the euler angles from the [-30, -30, -30] to [width/2, height/2, depth/2]
         # are [atan2(width/2 +30, depth/2 + 30), atan2(height/2 + 30, depth/2 + 30), 0]
         camera_rotation = R.from_euler('xyz', [
-                                           np.arctan2(self.core.width/2 + 30, self.core.depth/2 + 30),
-                                           np.arctan2(np.sqrt((self.core.width/2 + 30) ** 2 + (self.core.depth/2 + 30) ** 2), self.core.height/2 + 30),
-                                           0
-                                       ], degrees=False)
-        camera_fov = np.array([np.pi/3, np.pi/3, 30, 300])
+            np.arctan2(self.core.width / 2 + 30, self.core.depth / 2 + 30),
+            np.arctan2(np.sqrt((self.core.width / 2 + 30) ** 2 + (self.core.depth / 2 + 30) ** 2),
+                       self.core.height / 2 + 30),
+            0
+        ], degrees=False)
+        camera_fov = np.array([np.pi / 3, np.pi / 3, 30, 300])
         camera_height = 100
         camera_width = 100
         camera_depth_resolution = 100
-        axes[0, 0].imshow(self.camera_view(camera_position, camera_rotation, camera_fov, camera_height, camera_width, camera_depth_resolution))
+        axes[0, 0].imshow(self.camera_view(camera_position, camera_rotation, camera_fov, camera_height, camera_width,
+                                           camera_depth_resolution))
         axes[0, 0].set_title('Front top left')
         # front top right camera
         camera_position = np.array([-30, 230, -30])
@@ -189,12 +282,13 @@ class Grasp3DViewer(object):
         # the euler angles from the [30, -30, -30] to [width/2, height/2, depth/2]
         # are [atan2(width/2 -30, depth/2 + 30), atan2(height/2 + 30, depth/2 + 30), 0]
         camera_rotation = R.from_euler('xyz', [
-                                            -np.arctan2(self.core.width/2 + 30, self.core.depth/2 + 30),
-                                            np.arctan2(np.sqrt((self.core.width/2 + 30) ** 2 + (self.core.depth/2 + 30) ** 2), self.core.height/2 + 30),
-                                            0
-                                        ], degrees=False)
-        axes[0, 2].imshow(self.camera_view(camera_position, camera_rotation, camera_fov, camera_height, camera_width, camera_depth_resolution))
+            -np.arctan2(self.core.width / 2 + 30, self.core.depth / 2 + 30),
+            np.arctan2(np.sqrt((self.core.width / 2 + 30) ** 2 + (self.core.depth / 2 + 30) ** 2),
+                       self.core.height / 2 + 30),
+            0
+        ], degrees=False)
+        axes[0, 2].imshow(self.camera_view(camera_position, camera_rotation, camera_fov, camera_height, camera_width,
+                                           camera_depth_resolution))
         axes[0, 2].set_title('Front top right')
-
 
         plt.show()
